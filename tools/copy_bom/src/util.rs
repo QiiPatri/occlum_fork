@@ -11,6 +11,12 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::vec;
+use std::fs::OpenOptions;
+use std::io::Write;
+
+lazy_static! {
+    static ref LOG_FILTER_PATH: Mutex<Option<String>> = Mutex::new(None);
+}
 
 /// This structure represents loader information in config file.
 /// `loader_paths` stores the actual path of each loader. key: the loader name, value: the loader path in host
@@ -52,8 +58,9 @@ lazy_static! {
                 let loader_path = line_split[0].to_string();
                 let loader_path_buf = PathBuf::from(&loader_path);
                 let loader_file_name = loader_path_buf.file_name().unwrap().to_string_lossy().to_string();
-                // The second string is LD_LIBRARY_PATH
-                let ld_library_path = line_split[1].to_string();
+                // The second string plus the loader directory is LD_LIBRARY_PATH
+                let loader_dir = loader_path_buf.parent().unwrap().to_string_lossy().to_string();
+                let ld_library_path = format!("{}:{}", loader_dir, line_split[1]);
                 // parse all libraries in LD_LIBRARY_PATH
                 let lib_paths = ld_library_path.split(':').filter(|s| s.len()>0).map(|s| s.to_string()).collect();
                 loader_paths.insert(loader_file_name, loader_path.clone());
@@ -88,11 +95,14 @@ lazy_static! {
 }
 
 pub fn copy_file(src: &str, dest: &str, dry_run: bool) {
-    info!("rsync -aL {} {}", src, dest);
+    info!("rsync -avL {} {}", src, dest);
     if !dry_run {
-        let output = Command::new("rsync").arg("-aL").arg(src).arg(dest).output();
+        let output = Command::new("rsync").arg("-avL").arg("--itemize-changes").arg(src).arg(dest).output();
         match output {
-            Ok(output) => deal_with_output(output, COPY_FILE_ERROR),
+            Ok(output) => {
+                save_moved_files(&output, dest);
+                deal_with_output(output, COPY_FILE_ERROR)
+            }
             Err(e) => {
                 error!("copy file {} to {} failed. {}", src, dest, e);
                 std::process::exit(COPY_FILE_ERROR);
@@ -135,7 +145,7 @@ pub fn create_link(src: &str, linkname: &str, dry_run: bool) {
 pub fn copy_dir(src: &str, dest: &str, dry_run: bool, excludes: &Vec<String>) {
     // we should not pass --delete args. Otherwise it will overwrite files in the same place
     // We pass --copy-unsafe-links instead of -L arg. So links point to current directory will be kept.
-    let mut args: Vec<_> = vec!["-ar", "--copy-unsafe-links"]
+    let mut args: Vec<_> = vec!["-avr", "--copy-unsafe-links"]
         .into_iter()
         .map(|s| s.to_string())
         .collect();
@@ -146,9 +156,12 @@ pub fn copy_dir(src: &str, dest: &str, dry_run: bool, excludes: &Vec<String>) {
     args.extend(excludes.into_iter());
     info!("rsync {} {} {}", format_command_args(&args), src, dest);
     if !dry_run {
-        let output = Command::new("rsync").args(args).arg(src).arg(dest).output();
+        let output = Command::new("rsync").args(args).arg("--itemize-changes").arg(src).arg(dest).output();
         match output {
-            Ok(output) => deal_with_output(output, CREATE_DIR_ERROR),
+            Ok(output) => {
+                save_moved_files_indir(&output, dest);
+                deal_with_output(output, CREATE_DIR_ERROR)
+            }
             Err(e) => {
                 error!("copy dir {} to {} failed. {}", src, dest, e);
                 std::process::exit(COPY_DIR_ERROR);
@@ -425,10 +438,10 @@ pub fn extract_dependencies_from_output(
                             .to_string_lossy()
                             .to_string();
                         // if the shared object is from one of the default dirs,
-                        // we will copy to the the loader dir
+                        // we will copy to the first default dir(the loader dir)
                         // Otherwise it will be copied to the same dir as its dir in host.
                         if default_lib_dirs.contains(&lib_dir_in_host) {
-                            let target_dir = loader_dir.clone();
+                            let target_dir = default_lib_dirs.first().unwrap();
                             let target_path = PathBuf::from(target_dir)
                                 .join(file_name)
                                 .to_string_lossy()
@@ -618,4 +631,128 @@ pub fn check_rsync() {
     }
     println!("rsync is not installed.");
     std::process::exit(RSYNC_NOT_FOUND_ERROR);
+}
+
+/// Logs files that have been moved during a single file copy operation
+/// 
+/// If filter_path is set, only files under the filter_path will be logged, and their paths will be 
+/// recorded relative to the filter_path. If filter_path is None, the function will return immediately
+/// without performing any operation.
+fn save_moved_files(output: &Output, dest: &str) {
+    let filter_path = LOG_FILTER_PATH.lock().unwrap();
+    if filter_path.is_none() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("moved_files.log")
+        .expect("Failed to open log file");
+    let dest_path = PathBuf::from(dest).canonicalize().unwrap_or_else(|_| PathBuf::from(dest));
+
+    
+    for line in stdout.lines() {
+        if line.contains(">") {
+            // Build absolute path
+            let abs_path = if dest_path.is_absolute() {
+                dest_path.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(dest_path.clone())
+            };
+
+            // Check if file is under filter_path
+            if let Some(ref filter) = *filter_path {
+                let filter_pathbuf = PathBuf::from(filter);
+                
+                if abs_path.starts_with(&filter_pathbuf) {
+                    // Calculate relative path (starting after filter_path)
+                    let rel_path = abs_path.strip_prefix(&filter_pathbuf)
+                        .unwrap_or(&abs_path)
+                        .to_string_lossy()
+                        .to_string();
+                    
+                    // Ensure relative path doesn't start with '/'
+                    let rel_path = if rel_path.starts_with('/') {
+                        rel_path[1..].to_string()
+                    } else {
+                        rel_path
+                    };
+                    
+                    writeln!(file, "{}", rel_path)
+                        .expect("Failed to write to log file");
+                }
+            } else {
+                // When no filter path is provided, save the complete absolute path
+                writeln!(file, "{}", abs_path.to_string_lossy())
+                    .expect("Failed to write to log file");
+            }
+        }
+    }
+}
+
+/// Logs files that have been moved during a directory copy operation
+/// 
+/// If filter_path is set, only files under the filter_path will be logged, and their paths will be 
+/// recorded relative to the filter_path. If filter_path is None, the function will return immediately
+/// without performing any operation.
+fn save_moved_files_indir(output: &Output, dest: &str) {
+    let filter_path = LOG_FILTER_PATH.lock().unwrap();
+    if filter_path.is_none() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("moved_files.log")
+        .expect("Failed to open log file");
+    let dest_path = PathBuf::from(dest).canonicalize().unwrap_or_else(|_| PathBuf::from(dest));
+
+    
+    for line in stdout.lines() {
+        if line.contains(">") {
+            if let Some(filename) = line.split_whitespace().last() {
+                // Build absolute path for the target file
+                let file_path = PathBuf::from(filename);
+                let abs_path = if dest_path.is_absolute() {
+                    dest_path.join(file_path)
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(dest_path.clone()).join(file_path)
+                };
+                
+                // Check if file is under filter_path
+                if let Some(ref filter) = *filter_path {
+                    let filter_pathbuf = PathBuf::from(filter);
+                    
+                    if abs_path.starts_with(&filter_pathbuf) {
+                        // Calculate relative path (starting after filter_path)
+                        let rel_path = abs_path.strip_prefix(&filter_pathbuf)
+                            .unwrap_or(&abs_path)
+                            .to_string_lossy()
+                            .to_string();
+                        
+                        // Ensure relative path doesn't start with '/'
+                        let rel_path = if rel_path.starts_with('/') {
+                            rel_path[1..].to_string()
+                        } else {
+                            rel_path
+                        };
+                        
+                        writeln!(file, "{}", rel_path)
+                            .expect("Failed to write to log file");
+                    }
+                } else {
+                    // When no filter path is provided, save the complete absolute path
+                    writeln!(file, "{}", abs_path.to_string_lossy())
+                    .expect("Failed to write to log file");
+}
+            }
+        }
+    }
+}
+
+pub fn set_log_filter_path(path: Option<String>) {
+    let mut filter_path = LOG_FILTER_PATH.lock().unwrap();
+    *filter_path = path;
 }
